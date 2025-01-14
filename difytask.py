@@ -38,6 +38,7 @@ class DifyTask(Plugin):
     _scheduler = None
     _scheduler_lock = threading.Lock()
     _running = False
+    _message_lock = threading.Lock()  # 添加消息发送锁
 
     def __init__(self):
         # 确保只初始化一次
@@ -85,6 +86,13 @@ class DifyTask(Plugin):
             
             logger.info("[DifyTask] plugin initialized")
             self._initialized = True
+
+            # 添加联系人缓存相关
+            self.contacts_cache = {
+                "last_update": 0,
+                "contacts": []
+            }
+            self.contacts_cache_timeout = 600  # 联系人缓存超时时间（10分钟）
 
     def reload(self):
         """重载时停止旧线程，返回 (success, message)"""
@@ -145,30 +153,28 @@ class DifyTask(Plugin):
                 if now.hour == 3 and now.minute == 0:
                     self._clean_expired_tasks()
                 
-                # 每6小时更新一次群信息
-                if current_time - last_group_update > 21600:  # 21600秒 = 6小时
+                # 每小时更新一次群组信息
+                if current_time - last_group_update >= 3600:
                     self._update_groups()
                     last_group_update = current_time
-                
+
                 # 从数据库获取所有任务
                 conn = sqlite3.connect(self.db_path)
                 cursor = conn.cursor()
                 
                 try:
-                    # 开始事务
+                    # 使用 IMMEDIATE 事务级别确保并发安全
                     cursor.execute('BEGIN IMMEDIATE')
                     
                     # 获取需要执行的任务
-                    cursor.execute('''
-                        SELECT id, cron, context, last_executed_at 
-                        FROM tasks 
-                        WHERE last_executed_at < ?
-                    ''', (current_time - 60,))
+                    cursor.execute(
+                        'SELECT id, cron, context, last_executed_at FROM tasks WHERE last_executed_at < ? AND (executing_at = 0 OR executing_at < ?)',
+                        (current_time - 60, current_time - 30)  # 30秒超时保护
+                    )
                     
                     tasks = cursor.fetchall()
                     tasks_to_execute = []
                     
-                    # 首先尝试更新所有需要执行的任务
                     for task_id, cron_exp, context_json, last_executed_at in tasks:
                         try:
                             cron = croniter(cron_exp, now)
@@ -177,32 +183,58 @@ class DifyTask(Plugin):
                             
                             # 检查是否在执行时间窗口内
                             if 0 <= time_diff < 60:
-                                # 尝试更新执行时间
+                                # 立即尝试更新执行状态，使用 IMMEDIATE 事务确保原子性
                                 cursor.execute('''
                                     UPDATE tasks 
-                                    SET last_executed_at = ? 
+                                    SET executing_at = ?,
+                                        last_executed_at = ?
                                     WHERE id = ? 
+                                    AND (executing_at = 0 OR executing_at < ?)
                                     AND last_executed_at < ?
-                                ''', (current_time, task_id, current_time - 60))
+                                ''', (current_time, current_time, task_id, current_time - 30, current_time - 60))
                                 
-                                # 如果更新成功，将任务添加到执行列表
+                                # 只有成功更新状态的任务才会被执行
                                 if cursor.rowcount > 0:
                                     tasks_to_execute.append((task_id, context_json))
+                                    logger.info(f"[DifyTask] 任务 {task_id} 标记为执行中")
                         
                         except Exception as e:
                             logger.error(f"[DifyTask] 检查任务异常: {task_id} {str(e)}")
                             continue
                     
-                    # 提交事务，确保所有更新都已完成
+                    # 提交状态更新
                     conn.commit()
                     
-                    # 执行所有已更新的任务
+                    # 执行任务
                     for task_id, context_json in tasks_to_execute:
                         try:
                             context_info = json.loads(context_json)
                             self._execute_task(task_id, context_info)
+                            
+                            # 任务执行完成后，开始新事务更新状态
+                            cursor.execute('BEGIN IMMEDIATE')
+                            
+                            # 检查是否是一次性任务并处理
+                            cursor.execute('SELECT circle FROM tasks WHERE id = ?', (task_id,))
+                            result = cursor.fetchone()
+                            
+                            if result and (len(result[0]) == 10 or result[0] in ["今天", "明天", "后天"]):
+                                cursor.execute('DELETE FROM tasks WHERE id = ?', (task_id,))
+                                logger.info(f"[DifyTask] 已删除一次性任务: {task_id}")
+                            else:
+                                cursor.execute('UPDATE tasks SET executing_at = 0 WHERE id = ?', (task_id,))
+                            
+                            conn.commit()
+                            
                         except Exception as e:
                             logger.error(f"[DifyTask] 执行任务异常: {task_id} {str(e)}")
+                            # 发生错误时也要清除执行状态
+                            try:
+                                cursor.execute('BEGIN IMMEDIATE')
+                                cursor.execute('UPDATE tasks SET executing_at = 0 WHERE id = ?', (task_id,))
+                                conn.commit()
+                            except Exception as e2:
+                                logger.error(f"[DifyTask] 清除执行状态失败: {task_id} {str(e2)}")
                     
                 except Exception as e:
                     # 如果发生异常，回滚事务
@@ -228,7 +260,7 @@ class DifyTask(Plugin):
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             
-            # 创建任务表，添加 last_executed_at 字段
+            # 创建任务表
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS tasks (
                     id TEXT PRIMARY KEY,
@@ -238,15 +270,22 @@ class DifyTask(Plugin):
                     event TEXT NOT NULL,
                     context TEXT NOT NULL,
                     created_at INTEGER NOT NULL,
-                    last_executed_at INTEGER DEFAULT 0
+                    last_executed_at INTEGER DEFAULT 0,
+                    executing_at INTEGER DEFAULT 0
                 )
             ''')
             
-            # 为现有表添加 last_executed_at 字段（如果不存在）
-            try:
-                cursor.execute('ALTER TABLE tasks ADD COLUMN last_executed_at INTEGER DEFAULT 0')
-            except sqlite3.OperationalError:
-                pass  # 字段已存在，忽略错误
+            # 检查 executing_at 字段是否存在
+            cursor.execute("PRAGMA table_info(tasks)")
+            columns = [column[1] for column in cursor.fetchall()]
+            
+            # 如果字段不存在，添加它
+            if 'executing_at' not in columns:
+                try:
+                    cursor.execute('ALTER TABLE tasks ADD COLUMN executing_at INTEGER DEFAULT 0')
+                    logger.info("[DifyTask] Added executing_at column to tasks table")
+                except sqlite3.OperationalError as e:
+                    logger.error(f"[DifyTask] Error adding executing_at column: {e}")
             
             # 创建群组信息表
             cursor.execute('''
@@ -319,7 +358,7 @@ class DifyTask(Plugin):
 
 1. 创建定时任务
 基础格式：
-{self.command_prefix} 周期 时间 事件内容
+{self.command_prefix} 周期 时间 [u[用户]] 事件内容
 
 支持的周期格式：
 - 每天 09:30 早安
@@ -330,15 +369,19 @@ class DifyTask(Plugin):
 - 后天 09:00 周末快乐
 - 2024-01-01 12:00 新年快乐
 
+用户提醒格式：
+{self.command_prefix} 今天 13:16 u[张三] 早报
+{self.command_prefix} 每天 09:30 u[李四] 喝水提醒
+
+群聊任务格式：
+{self.command_prefix} 每天 09:30 g[测试群]早安
+
 Cron表达式格式（高级）：
 {self.command_prefix} cron[分 时 日 月 周] 事件内容
 例如：
 {self.command_prefix} cron[0 9 * * 1-5] 该起床了
 {self.command_prefix} cron[*/30 * * * *] 喝水提醒
 {self.command_prefix} cron[0 */2 * * *] 休息一下
-
-私聊时创建群任务：
-{self.command_prefix} 每天 09:30 g[测试群]早安
 
 2. 查看任务列表
 {self.command_prefix} 任务列表 密码
@@ -616,13 +659,64 @@ Cron表达式格式（高级）：
             if not exists:
                 return result
 
+    def _get_contacts(self):
+        """获取联系人列表，优先使用缓存"""
+        current_time = int(time.time())
+        
+        # 检查缓存是否有效
+        if (current_time - self.contacts_cache["last_update"]) < self.contacts_cache_timeout:
+            logger.debug("[DifyTask] 使用缓存的联系人列表")
+            return self.contacts_cache["contacts"]
+        
+        try:
+            # 先尝试从缓存接口获取
+            response = requests.post(
+                f"{conf().get('gewechat_base_url')}/contacts/fetchContactsListCache",
+                json={"appId": conf().get('gewechat_app_id')},
+                headers={"X-GEWE-TOKEN": conf().get('gewechat_token')}
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                logger.debug(f"[DifyTask] 缓存联系人列表响应: {data}")
+                if data.get('ret') == 200 and data.get('data', {}).get('friends'):
+                    contacts = data['data']['friends']
+                    self.contacts_cache = {
+                        "last_update": current_time,
+                        "contacts": contacts
+                    }
+                    return contacts
+            
+            # 如果缓存接口失败或返回空，尝试实时获取
+            logger.info("[DifyTask] 缓存为空或失效，尝试实时获取联系人列表")
+            response = requests.post(
+                f"{conf().get('gewechat_base_url')}/contacts/fetchContactsList",
+                json={"appId": conf().get('gewechat_app_id')},
+                headers={"X-GEWE-TOKEN": conf().get('gewechat_token')}
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                logger.debug(f"[DifyTask] 实时联系人列表响应: {data}")
+                if data.get('ret') == 200 and data.get('data', {}).get('friends'):
+                    contacts = data['data']['friends']
+                    self.contacts_cache = {
+                        "last_update": current_time,
+                        "contacts": contacts
+                    }
+                    return contacts
+            
+            logger.error("[DifyTask] 获取联系人列表失败（缓存和实时都失败）")
+            return []
+            
+        except Exception as e:
+            logger.error(f"[DifyTask] 获取联系人列表异常: {e}")
+            return []
+
     def _create_task(self, time_str, circle_str, event_str, context):
         """创建任务"""
         try:
-            # 获取消息相关信息
-            cmsg: ChatMessage = context.get("msg", None)
-            
-            # 如果是cron表达式，直接验证cron格式
+            # 1. 基本格式验证
             if circle_str.startswith("cron[") and circle_str.endswith("]"):
                 cron_exp = circle_str[5:-1].strip()  # 移除前后空格
                 logger.debug(f"[DifyTask] 解析cron表达式: {cron_exp}")
@@ -651,25 +745,22 @@ Cron表达式格式（高级）：
                     logger.debug("[DifyTask] 周期格式验证失败")
                     return "周期格式错误，支持：每天、每周x、工作日、YYYY-MM-DD、今天、明天、后天"
 
-            # 转换为cron表达式
+            # 2. 转换cron表达式
             cron_exp = self._convert_to_cron(circle_str, time_str)
             if not cron_exp:
                 return "转换cron表达式失败"
-                
-            # 生成任务ID
-            task_id = self._generate_task_id()
-            logger.debug(f"[DifyTask] 生成任务ID: {task_id}")
-            
-            # 获取消息相关信息
+
+            # 3. 获取基本消息信息
             cmsg: ChatMessage = context.get("msg", None)
             logger.debug(f"[DifyTask] 原始消息对象: {cmsg}")
             msg_info = {}
             
-            # 检查是否在私聊中指定了群名
+            # 4. 检查是否在私聊中指定了群名
             is_group = context.get("isgroup", False)
             group_name = None
+
+            # 场景1：群聊场景 - 检查是否指定了群组
             if not is_group and event_str.startswith("g["):
-                # 从事件内容中提取群名，格式：g[群名]其他内容
                 match = re.match(r'g\[([^\]]+)\](.*)', event_str)
                 if match:
                     group_name = match.group(1)
@@ -698,8 +789,41 @@ Cron表达式格式（高级）：
                         logger.debug(f"[DifyTask] 找到群组: {group_name}, wxid: {group_wxid}")
                     else:
                         return f"未找到群组: {group_name}"
+
+            # 场景2：用户提醒场景 - 检查是否指定了用户
+            elif context.get('user_mention'):
+                target_user = context.get('user_mention')
+                # 验证用户是否存在
+                try:
+                    response = requests.post(
+                        f"{conf().get('gewechat_base_url')}/contacts/getBriefInfo",
+                        json={
+                            "appId": conf().get('gewechat_app_id'),
+                            "wxids": [target_user]
+                        },
+                        headers={
+                            "X-GEWE-TOKEN": conf().get('gewechat_token')
+                        }
+                    )
+                    if response.status_code != 200 or response.json().get('ret') != 200:
+                        return f"无法验证用户信息，请确保用户存在"
+                except Exception as e:
+                    logger.error(f"[DifyTask] 验证用户信息失败: {e}")
+                    return f"验证用户信息失败: {str(e)}"
+
+                # 设置用户提醒的消息信息
+                msg_info = {
+                    "from_user_id": target_user,  # 使用目标用户ID
+                    "actual_user_id": cmsg.from_user_id if cmsg else None,  # 保留原始发送者ID
+                    "to_user_id": cmsg.to_user_id if cmsg else None,
+                    "create_time": cmsg.create_time if cmsg else int(time.time()),
+                    "is_group": False,  # 用户提醒始终是私聊
+                    "user_mention": target_user  # 保存用户标记
+                }
+                is_group = False
+
+            # 常规消息处理（非指定群组或用户）
             else:
-                # 常规消息处理
                 if cmsg:
                     msg_info = {
                         "from_user_id": cmsg.from_user_id,
@@ -708,9 +832,11 @@ Cron表达式格式（高级）：
                         "create_time": cmsg.create_time,
                         "is_group": is_group
                     }
-            
-            logger.debug(f"[DifyTask] 处理后的消息信息: {msg_info}")
-            
+
+            # 5. 生成任务ID并创建任务
+            task_id = self._generate_task_id()
+            logger.debug(f"[DifyTask] 生成任务ID: {task_id}")
+
             # 构建上下文信息
             context_info = {
                 "type": context.type.name,
@@ -742,6 +868,7 @@ Cron表达式格式（高级）：
             
             logger.debug(f"[DifyTask] 任务创建成功: {task_id}")
             return f"已创建任务: [{task_id}] {time_str} {circle_str} {event_str}"
+
         except Exception as e:
             logger.error(f"[DifyTask] 创建任务失败: {e}")
             return f"创建任务失败: {str(e)}"
@@ -820,28 +947,32 @@ Cron表达式格式（高级）：
             content = context_info.get('content', '')
             is_group = context_info.get('isgroup', False)
             
+            logger.info(f"[DifyTask] 开始执行任务: {task_id}")
+            
             # 判断是否是提醒功能
             if content.startswith('提醒'):
                 try:
-                    from lib.gewechat import GewechatClient
-                    
-                    # 创建客户端
-                    client = GewechatClient(
-                        base_url=conf().get("gewechat_base_url"),
-                        token=conf().get("gewechat_token")
-                    )
-                    
-                    # 去掉"提醒"前缀并格式化消息
-                    reminder_content = content[2:].strip()  # 移除"提醒"两个字
-                    reminder_message = f"⏰ 定时提醒\n{'-' * 20}\n{reminder_content}\n{'-' * 20}\n发送时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                    
-                    # 发送提醒消息
-                    client.post_text(
-                        conf().get("gewechat_app_id"),
-                        msg_info.get('from_user_id'),
-                        reminder_message
-                    )
-                    logger.info(f"[DifyTask] 已发送提醒消息: {task_id}")
+                    # 使用消息锁确保消息发送的原子性
+                    with self._message_lock:
+                        from lib.gewechat import GewechatClient
+                        
+                        # 创建客户端
+                        client = GewechatClient(
+                            base_url=conf().get("gewechat_base_url"),
+                            token=conf().get("gewechat_token")
+                        )
+                        
+                        # 去掉"提醒"前缀并格式化消息
+                        reminder_content = content[2:].strip()  # 移除"提醒"两个字
+                        reminder_message = f"⏰ 定时提醒\n{'-' * 20}\n{reminder_content}\n{'-' * 20}\n发送时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                        
+                        # 发送提醒消息
+                        client.post_text(
+                            conf().get("gewechat_app_id"),
+                            msg_info.get('from_user_id'),
+                            reminder_message
+                        )
+                        logger.info(f"[DifyTask] 已发送提醒消息: {task_id}")
                     
                 except Exception as e:
                     logger.error(f"[DifyTask] 发送提醒消息失败: {e}")
@@ -849,87 +980,88 @@ Cron表达式格式（高级）：
             else:
                 # 非提醒消息，需要转发给其他插件处理
                 try:
-                    chat_msg = ChatMessage({})
-                    chat_msg.content = content
-                    chat_msg.from_user_id = msg_info.get('from_user_id')
-                    chat_msg.to_user_id = msg_info.get('to_user_id')
-                    chat_msg.actual_user_id = msg_info.get('actual_user_id', msg_info.get('from_user_id'))
-                    chat_msg.create_time = msg_info.get("create_time", int(time.time()))
-                    chat_msg.is_group = is_group
-                    chat_msg._prepared = True
-                    
-                    # 设置其他用户ID和昵称
-                    chat_msg.other_user_id = chat_msg.from_user_id
-                    
-                    # 为群消息设置额外属性
-                    if is_group:
-                        try:
-                            # 使用群聊专用接口获取群信息
-                            group_info = self.client.get_chatroom_info(
-                                self.app_id,
-                                chat_msg.from_user_id
-                            )
-                            if group_info.get('ret') == 200:
-                                data = group_info.get('data', {})
-                                chat_msg.other_user_nickname = data.get('nickName', chat_msg.from_user_id)
-                                chat_msg.actual_user_nickname = data.get('nickName', chat_msg.from_user_id)
-                            else:
-                                logger.error(f"[DifyTask] 获取群信息失败: {group_info}")
+                    with self._message_lock:
+                        chat_msg = ChatMessage({})
+                        chat_msg.content = content
+                        chat_msg.from_user_id = msg_info.get('from_user_id')
+                        chat_msg.to_user_id = msg_info.get('to_user_id')
+                        chat_msg.actual_user_id = msg_info.get('actual_user_id', msg_info.get('from_user_id'))
+                        chat_msg.create_time = msg_info.get("create_time", int(time.time()))
+                        chat_msg.is_group = is_group
+                        chat_msg._prepared = True
+                        
+                        # 设置其他用户ID和昵称
+                        chat_msg.other_user_id = chat_msg.from_user_id
+                        
+                        # 为群消息设置额外属性
+                        if is_group:
+                            try:
+                                # 使用群聊专用接口获取群信息
+                                group_info = self.client.get_chatroom_info(
+                                    self.app_id,
+                                    chat_msg.from_user_id
+                                )
+                                if group_info.get('ret') == 200:
+                                    data = group_info.get('data', {})
+                                    chat_msg.other_user_nickname = data.get('nickName', chat_msg.from_user_id)
+                                    chat_msg.actual_user_nickname = data.get('nickName', chat_msg.from_user_id)
+                                else:
+                                    logger.error(f"[DifyTask] 获取群信息失败: {group_info}")
+                                    chat_msg.other_user_nickname = chat_msg.from_user_id
+                                    chat_msg.actual_user_nickname = chat_msg.from_user_id
+                            except Exception as e:
+                                logger.error(f"[DifyTask] 获取群名称失败: {e}")
                                 chat_msg.other_user_nickname = chat_msg.from_user_id
                                 chat_msg.actual_user_nickname = chat_msg.from_user_id
-                        except Exception as e:
-                            logger.error(f"[DifyTask] 获取群名称失败: {e}")
-                            chat_msg.other_user_nickname = chat_msg.from_user_id
-                            chat_msg.actual_user_nickname = chat_msg.from_user_id
-                    else:
-                        # 获取用户昵称
-                        try:
-                            response = requests.post(
-                                f"{conf().get('gewechat_base_url')}/contacts/getBriefInfo",
-                                json={
-                                    "appId": conf().get('gewechat_app_id'),
-                                    "wxids": [chat_msg.from_user_id]
-                                },
-                                headers={
-                                    "X-GEWE-TOKEN": conf().get('gewechat_token')
-                                }
-                            )
-                            if response.status_code == 200:
-                                data = response.json()
-                                if data.get('ret') == 200 and data.get('data'):
-                                    chat_msg.other_user_nickname = data['data'][0].get('nickName', chat_msg.from_user_id)
-                                    chat_msg.actual_user_nickname = data['data'][0].get('nickName', chat_msg.from_user_id)
+                        else:
+                            # 获取用户昵称
+                            try:
+                                response = requests.post(
+                                    f"{conf().get('gewechat_base_url')}/contacts/getBriefInfo",
+                                    json={
+                                        "appId": conf().get('gewechat_app_id'),
+                                        "wxids": [chat_msg.from_user_id]
+                                    },
+                                    headers={
+                                        "X-GEWE-TOKEN": conf().get('gewechat_token')
+                                    }
+                                )
+                                if response.status_code == 200:
+                                    data = response.json()
+                                    if data.get('ret') == 200 and data.get('data'):
+                                        chat_msg.other_user_nickname = data['data'][0].get('nickName', chat_msg.from_user_id)
+                                        chat_msg.actual_user_nickname = data['data'][0].get('nickName', chat_msg.from_user_id)
+                                    else:
+                                        chat_msg.other_user_nickname = chat_msg.from_user_id
+                                        chat_msg.actual_user_nickname = chat_msg.from_user_id
                                 else:
                                     chat_msg.other_user_nickname = chat_msg.from_user_id
                                     chat_msg.actual_user_nickname = chat_msg.from_user_id
-                            else:
+                            except Exception as e:
+                                logger.error(f"[DifyTask] 获取用户昵称失败: {e}")
                                 chat_msg.other_user_nickname = chat_msg.from_user_id
                                 chat_msg.actual_user_nickname = chat_msg.from_user_id
-                        except Exception as e:
-                            logger.error(f"[DifyTask] 获取用户昵称失败: {e}")
-                            chat_msg.other_user_nickname = chat_msg.from_user_id
-                            chat_msg.actual_user_nickname = chat_msg.from_user_id
-                    
-                    # 构建 Context
-                    context = Context(ContextType.TEXT, content)
-                    context["session_id"] = msg_info.get('from_user_id')
-                    context["receiver"] = msg_info.get('from_user_id')
-                    context["msg"] = chat_msg
-                    context["isgroup"] = is_group
-                    context["group_name"] = chat_msg.other_user_nickname if is_group else None
-                    context["is_shared_session_group"] = True if is_group else False
-                    context["origin_ctype"] = ContextType.TEXT
-                    context["openai_api_key"] = None
-                    context["gpt_model"] = None
-                    context["no_need_at"] = True
-                    
-                    # 创建 channel 并发送消息
-                    from channel.gewechat.gewechat_channel import GeWeChatChannel
-                    channel = GeWeChatChannel()
-                    if not channel.client:
-                        channel.client = self.client
-                    channel.produce(context)
-                    logger.info(f"[DifyTask] 已转发消息到插件处理: {task_id}")
+                        
+                        # 构建 Context
+                        context = Context(ContextType.TEXT, content)
+                        context["session_id"] = msg_info.get('from_user_id')
+                        context["receiver"] = msg_info.get('from_user_id')
+                        context["msg"] = chat_msg
+                        context["isgroup"] = is_group
+                        context["group_name"] = chat_msg.other_user_nickname if is_group else None
+                        context["is_shared_session_group"] = True if is_group else False
+                        context["origin_ctype"] = ContextType.TEXT
+                        context["openai_api_key"] = None
+                        context["gpt_model"] = None
+                        context["no_need_at"] = True
+                        
+                        # 创建 channel 并发送消息
+                        from channel.gewechat.gewechat_channel import GeWeChatChannel
+                        channel = GeWeChatChannel()
+                        if not channel.client:
+                            channel.client = self.client
+                        channel.produce(context)
+                        logger.info(f"[DifyTask] 已转发消息到插件处理: {task_id}")
                     
                 except Exception as e:
                     logger.error(f"[DifyTask] 转发消息失败: {e}")
@@ -952,6 +1084,8 @@ Cron表达式格式（高级）：
             except Exception as e:
                 logger.error(f"[DifyTask] 删除一次性任务失败: {task_id} {e}")
             
+            logger.info(f"[DifyTask] 任务执行完成: {task_id}")
+            
         except Exception as e:
             logger.error(f"[DifyTask] 执行任务异常: {e}")
 
@@ -967,6 +1101,8 @@ Cron表达式格式（高级）：
 
     def on_handle_context(self, e_context: EventContext):
         """处理消息"""
+        import re  # 显式导入 re 模块
+        
         if e_context['context'].type != ContextType.TEXT:
             return
 
@@ -1035,7 +1171,6 @@ Cron表达式格式（高级）：
             # 先检查是否是 cron 表达式
             if "cron[" in command:
                 # 使用正则表达式匹配 cron 表达式和事件内容
-                import re
                 match = re.match(r'cron\[(.*?)\]\s*(.*)', command)
                 if match:
                     cron_exp = match.group(1).strip()
@@ -1057,6 +1192,57 @@ Cron表达式格式（高级）：
             parts = command.split(" ", 2)
             if len(parts) == 3:
                 circle_str, time_str, event_str = parts
+                
+                # 检查是否包含用户标记
+                user_name = None
+                if 'u[' in event_str:
+                    match = re.match(r'u\[([^\]]+)\]\s*(.*)', event_str)
+                    if match:
+                        user_name = match.group(1)
+                        event_str = match.group(2).strip()
+                        
+                        # 获取联系人列表并查找目标用户
+                        contacts = self._get_contacts()
+                        target_user = None
+                        
+                        if contacts:
+                            # 获取每个联系人的详细信息
+                            for wxid in contacts:
+                                try:
+                                    response = requests.post(
+                                        f"{conf().get('gewechat_base_url')}/contacts/getBriefInfo",
+                                        json={
+                                            "appId": conf().get('gewechat_app_id'),
+                                            "wxids": [wxid]
+                                        },
+                                        headers={
+                                            "X-GEWE-TOKEN": conf().get('gewechat_token')
+                                        }
+                                    )
+                                    if response.status_code == 200:
+                                        data = response.json()
+                                        if data.get('ret') == 200 and data.get('data'):
+                                            contact_info = data['data'][0]
+                                            if contact_info.get('nickName') == user_name:
+                                                target_user = wxid
+                                                logger.info(f"[DifyTask] 找到目标用户: {user_name} -> {target_user}")
+                                                break
+                                except Exception as e:
+                                    logger.error(f"[DifyTask] 获取用户详情失败: {e}")
+                                    continue
+                            
+                            if not target_user:
+                                e_context['reply'] = Reply(ReplyType.ERROR, f"未找到用户: {user_name}，请确保昵称完全匹配")
+                                e_context.action = EventAction.BREAK_PASS
+                                return
+                        else:
+                            e_context['reply'] = Reply(ReplyType.ERROR, "获取联系人列表失败，请稍后重试")
+                            e_context.action = EventAction.BREAK_PASS
+                            return
+                        
+                        # 修改上下文信息，添加用户标记
+                        e_context['context']['user_mention'] = target_user
+                
                 result = self._create_task(time_str, circle_str, event_str, e_context['context'])
                 e_context['reply'] = Reply(ReplyType.TEXT, result)
                 e_context.action = EventAction.BREAK_PASS
